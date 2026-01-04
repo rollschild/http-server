@@ -47,6 +47,8 @@
 
               lua5_4_compat
               sol2
+
+              starship
             ];
 
             buildInputs = with pkgs; [
@@ -63,14 +65,19 @@
 
             # Setting up the environment variables you need during
             # development.
-            shellHook =
-              let
-                icon = "f121";
-              in
-              ''
-                export PS1="$(echo -e '\u${icon}') {\[$(tput sgr0)\]\[\033[38;5;228m\]\w\[$(tput sgr0)\]\[\033[38;5;15m\]} (${name}) \\$ \[$(tput sgr0)\]"
-                export SHELL="${pkgs.zsh}/bin/zsh"
-              '';
+            # shellHook =
+            # let
+            # icon = "f121";
+            # in
+            # ''
+            # export PS1="$(echo -e '\u${icon}') {\[$(tput sgr0)\]\[\033[38;5;228m\]\w\[$(tput sgr0)\]\[\033[38;5;15m\]} (${name}) \\$ \[$(tput sgr0)\]"
+            # export SHELL="${pkgs.zsh}/bin/zsh"
+            # '';
+            shellHook = ''
+              export SHELL="${pkgs.zsh}/bin/zsh"
+              exec ${pkgs.zsh}/bin/zsh
+              eval "$(starship init zsh)"
+            '';
           };
         }
       );
