@@ -57,7 +57,7 @@
             ];
 
             CXXFLAGS = "-Wall -Wfatal-errors -std=c++23";
-            LDFLAGS = "-lSDL2 -lSDL2_image -lSDL2_gfx -lSDL2_ttf -lSDL2_mixer -llua -lm";
+            # LDFLAGS = "-lSDL2 -lSDL2_image -lSDL2_gfx -lSDL2_ttf -lSDL2_mixer -llua -lm";
             # CPATH = builtins.concatStringsSep ":" [
             # (lib.makeSearchPathOutput "dev" "include" [ llvm.libcxx ])
             # (lib.makeSearchPath "resource-root/include" [ llvm.clang ])
