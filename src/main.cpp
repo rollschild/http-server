@@ -4,81 +4,129 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <condition_variable>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
+#include <queue>
+#include <stop_token>
 #include <string>
-#include <string_view>
+#include <thread>
+#include <vector>
 
-int main(/*int argc, char **argv*/) {
-    // Flush the buffer after every output operation: std::cout / std::cerr
-    // output appears immediately rather than being buffered
-    std::cout << std::unitbuf;
-    std::cerr << std::unitbuf;
+// global shutdown flag
+std::atomic<bool> g_shutdown_requested{false};
 
-    // socket creation
-    // AF_INET: ipv4 address family
-    // SOCK_STREAM: TCP
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        std::cerr << "Failed to create server socket\n";
-        return 1;
+// Signal handler
+// signal handlers are called by OS kernel, which uses C calling conventions
+// `extern "C"` avoids C++ name mangling so kernel can find the function
+extern "C" void signal_handler(int) {
+    g_shutdown_requested.store(true, std::memory_order_relaxed);
+}
+
+void setup_signal_handlers() {
+    // sigaction is POSIX
+    struct sigaction sa{};
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);   // Ctrl+C
+    sigaction(SIGTERM, &sa, nullptr);  // kill or system shutdown
+}
+
+void handle_client(int client_fd);
+
+class ThreadPool {
+   private:
+    std::atomic<bool> shutdown_requested;
+    std::vector<std::jthread> workers;
+    std::queue<int> task_queue;
+    std::mutex queue_mutex;
+    std::condition_variable_any queue_cv;
+
+    void worker_loop(std::stop_token stop_token) {
+        while (!stop_token.stop_requested()) {
+            int client_fd = -1;
+
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                bool has_work = queue_cv.wait(
+                    lock, stop_token, [this] { return !task_queue.empty(); });
+                if (!has_work) break;
+                client_fd = task_queue.front();
+                task_queue.pop();
+            }
+
+            if (client_fd >= 0) {
+                handle_client(client_fd);
+                close(client_fd);
+            }
+        }
     }
 
-    // SO_REUSEADDR allows socket to bind to an address that's in TIME_WAIT
-    // state if not using this, restarting server quickly would fail with
-    // 'Address already in use' because OS holds the port briefly after close
-    int reuse = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) <
-        0) {
-        std::cerr << "setsockopt failed\n";
-        return 1;
+   public:
+    explicit ThreadPool(
+        std::size_t num_threads = std::thread::hardware_concurrency())
+        : shutdown_requested(false) {
+        if (num_threads == 0) num_threads = 1;
+        workers.reserve(num_threads);
+        for (std::size_t i = 0; i < num_threads; ++i) {
+            workers.emplace_back(
+                [this](std::stop_token st) { worker_loop(st); });
+        }
     }
 
-    struct sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;  // ipv4
-    server_addr.sin_addr.s_addr =
-        INADDR_ANY;  // bind to all network interfaces (0.0.0.0)
-    server_addr.sin_port =
-        htons(4221);  // converted to network byte order (big-endian)
+    ~ThreadPool() { shutdown(); }
 
-    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) !=
-        0) {
-        std::cerr << "Failed to bind to port 4221\n";
-        return 1;
+    ThreadPool(const ThreadPool&) = delete;
+    ThreadPool& operator=(const ThreadPool&) = delete;
+
+    void shutdown() {
+        bool expected = false;
+        if (!shutdown_requested.compare_exchange_strong(expected, true)) return;
+
+        for (auto& worker : workers) {
+            // request stop on _ALL_ threads
+            // this should happen _BEFORE_ the `notify_all()` below
+            // **State first, signal second**
+            worker.request_stop();
+        }
+        queue_cv.notify_all();
+        workers.clear();
+
+        // close unhandled client connections
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        while (!task_queue.empty()) {
+            close(task_queue.front());
+            task_queue.pop();
+        }
     }
 
-    // max number of pending connections in queue before new ones are refused
-    int connection_backlog = 5;
-    // mark socket as passive - accepting connections
-    if (listen(server_fd, connection_backlog) != 0) {
-        std::cerr << "listen failed\n";
-        return 1;
+    void submit(int client_fd) {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            if (shutdown_requested.load()) {
+                close(client_fd);
+                return;
+            }
+            task_queue.push(client_fd);
+        }
+        queue_cv.notify_one();
     }
+};
 
-    struct sockaddr_in client_addr;
-    int client_addr_len = sizeof(client_addr);
-
-    std::cout << "Waiting for a client to connect...\n";
-
-    // _BLOCKS_ until a client connects
-    int client_fd = accept(server_fd, (struct sockaddr*)&client_addr,
-                           (socklen_t*)&client_addr_len);
-    if (client_fd < 0) {
-        std::cerr << "Failed to accept a connection!\n";
-        return 1;
-    }
-    std::cout << "Client connected\n";
-
+// HTTP request handler
+void handle_client(int client_fd) {
     // Read http request from client
     char buffer[1024] = {0};
     auto bytes_read = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
     if (bytes_read < 0) {
         std::cerr << "Failed to read request from client: " << client_fd
                   << std::endl;
-        close(client_fd);
-        close(server_fd);
-        return 1;
+        return;
     }
 
     // Parse
@@ -113,18 +161,78 @@ int main(/*int argc, char **argv*/) {
         response = "HTTP/1.1 404 Not Found\r\n\r\n";
     }
 
-    /*
-    switch (path) {
-        case "/":
-            break;
-        default:
-            response = "HTTP/1.1 404 Not Found\r\n\r\n";
-    }
-    */
-
     send(client_fd, response.data(), response.size(), 0);
+}
 
-    close(client_fd);
+int main(/*int argc, char **argv*/) {
+    // Flush the buffer after every output operation: std::cout / std::cerr
+    // output appears immediately rather than being buffered
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
+
+    std::size_t num_threads = std::thread::hardware_concurrency();
+
+    // socket creation
+    // AF_INET: ipv4 address family
+    // SOCK_STREAM: TCP
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        std::cerr << "Failed to create server socket\n";
+        return 1;
+    }
+
+    // SO_REUSEADDR allows socket to bind to an address that's in TIME_WAIT
+    // state if not using this, restarting server quickly would fail with
+    // 'Address already in use' because OS holds the port briefly after close
+    int reuse = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) <
+        0) {
+        std::cerr << "setsockopt failed\n";
+        return 1;
+    }
+
+    struct sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;  // ipv4
+    server_addr.sin_addr.s_addr =
+        INADDR_ANY;  // bind to all network interfaces (0.0.0.0)
+    server_addr.sin_port =
+        htons(4221);  // converted to network byte order (big-endian)
+
+    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) !=
+        0) {
+        std::cerr << "Failed to bind to port 4221\n";
+        return 1;
+    }
+
+    // max number of pending connections in queue before new ones are refused
+    int connection_backlog = 128;
+    // mark socket as passive - accepting connections
+    if (listen(server_fd, connection_backlog) != 0) {
+        std::cerr << "listen failed\n";
+        return 1;
+    }
+
+    // TODO
+    setup_signal_handlers();
+    ThreadPool pool(num_threads);
+    std::cout << "Server listening on 4221 with " << num_threads
+              << " worker threads\n";
+
+    while (!g_shutdown_requested.load()) {
+        struct sockaddr_in client_addr{};
+        socklen_t client_addr_len = sizeof(client_addr);
+        // _BLOCKS_ main loop until a client connects
+        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr,
+                               (socklen_t*)&client_addr_len);
+        if (client_fd < 0) {
+            // errno: EINTR
+            std::cerr << "Failed to accept a connection: " << strerror(errno)
+                      << std::endl;
+            continue;
+        }
+
+        pool.submit(client_fd);
+    }
 
     close(server_fd);
 
