@@ -9,9 +9,12 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <ios>
 #include <iostream>
 #include <mutex>
 #include <queue>
+#include <sstream>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -19,6 +22,9 @@
 
 // global shutdown flag
 std::atomic<bool> g_shutdown_requested{false};
+
+const std::string TMP_DIR = "/tmp";
+std::string g_files_dir{};
 
 // Signal handler
 // signal handlers are called by OS kernel, which uses C calling conventions
@@ -157,6 +163,31 @@ void handle_client(int client_fd) {
         response =
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
             std::to_string(user_agent.size()) + "\r\n\r\n" + user_agent;
+    } else if (path.starts_with("/files/")) {
+        // return file, located at hardcoded path for now, `/tmp/`
+        std::string filename = path.substr(7);
+        // security: reject path traversal attempts
+        if (filename.find("..") != std::string::npos) {
+            response = "HTTP/1.1 403 Forbidden\r\n\r\n";
+        } else if (g_files_dir.empty()) {
+            response = "HTTP/1.1 404 Not Found\r\n\r\n";
+        } else {
+            std::string filepath = g_files_dir + filename;
+            std::ifstream file(filepath, std::ios::binary);
+
+            if (!file) {
+                response = "HTTP/1.1 404 Not Found\r\n\r\n";
+            } else {
+                // read entire file into string
+                std::ostringstream ss;
+                ss << file.rdbuf();  // associated stream buffer
+                std::string content = ss.str();
+                response =
+                    "HTTP/1.1 200 OK\r\nContent-Type: "
+                    "application/octet-stream\r\nContent-Length: " +
+                    std::to_string(content.size()) + "\r\n\r\n" + content;
+            }
+        }
     } else {
         response = "HTTP/1.1 404 Not Found\r\n\r\n";
     }
@@ -164,11 +195,16 @@ void handle_client(int client_fd) {
     send(client_fd, response.data(), response.size(), 0);
 }
 
-int main(/*int argc, char **argv*/) {
+int main(int argc, char** argv) {
     // Flush the buffer after every output operation: std::cout / std::cerr
     // output appears immediately rather than being buffered
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
+
+    if (argc > 2 && (std::string(argv[1]).compare("--directory") == 0)) {
+        g_files_dir = argv[2];
+        std::cout << "files dir: " << g_files_dir << std::endl;
+    }
 
     std::size_t num_threads = std::thread::hardware_concurrency();
 
@@ -212,7 +248,6 @@ int main(/*int argc, char **argv*/) {
         return 1;
     }
 
-    // TODO
     setup_signal_handlers();
     ThreadPool pool(num_threads);
     std::cout << "Server listening on 4221 with " << num_threads
