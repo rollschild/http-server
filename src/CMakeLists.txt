@@ -1,4 +1,5 @@
 add_executable(main main.cpp)
 find_package(Threads REQUIRED)
-target_link_libraries(main PRIVATE Threads::Threads)
+find_package(ZLIB REQUIRED)
+target_link_libraries(main PRIVATE Threads::Threads ZLIB::ZLIB)
 target_sources(main PRIVATE main.cpp)

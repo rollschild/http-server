@@ -15,7 +15,7 @@ project(
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(sol2 REQUIRED)
+find_package(ZLIB REQUIRED)
 
 set(CMAKE_C_COMPILER gcc)
 if(MSVC)

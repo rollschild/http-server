@@ -3,7 +3,9 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <zlib.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <csignal>
@@ -124,6 +126,40 @@ class ThreadPool {
     }
 };
 
+std::string gzip_compress(const std::string& data) {
+    z_stream zs{};
+    // initializes with 15 + 16 window bits
+    // +16 tells zlib to produce gzip format (not raw deflate)
+    if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8,
+                     Z_DEFAULT_STRATEGY) != Z_OK) {
+        return "";
+    }
+
+    zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data.data()));
+    zs.avail_in = data.size();
+
+    std::string compressed;
+    // compress in 4096 chunks until completion
+    char buffer[4096];
+
+    do {
+        // points next_out to start of the buffer
+        zs.next_out = reinterpret_cast<Bytef*>(buffer);
+        // how many bytes are available in the output buffer
+        zs.avail_out = sizeof(buffer);
+        // compress; Z_FINISH signals this is the final (only) call
+        // zlib should flush everything
+        deflate(&zs, Z_FINISH);
+        // `sizeof(buffer) - zs.avail_out` calculates how many bytes were
+        // actually written 4096 minus remaining space
+        compressed.append(buffer, sizeof(buffer) - zs.avail_out);
+
+    } while (zs.avail_out == 0);
+
+    deflateEnd(&zs);
+    return compressed;
+}
+
 // HTTP request handler
 void handle_client(int client_fd) {
     // Read http request from client
@@ -152,6 +188,24 @@ void handle_client(int client_fd) {
         user_agent = request.substr(ua_start, ua_end - ua_start);
     }
 
+    std::vector<std::string> encodings;
+    size_t ae_pos = request.find("Accept-Encoding: ");
+    if (ae_pos != std::string::npos) {
+        size_t ae_start = ae_pos + 17;
+        size_t ae_end = request.find("\r\n", ae_start);
+        std::string ae_value = request.substr(ae_start, ae_end - ae_start);
+
+        // split by comma
+        std::istringstream ss(ae_value);
+        std::string encoding{};
+        while (std::getline(ss, encoding, ',')) {
+            // trim whitespaces
+            size_t start = encoding.find_first_not_of(' ');
+            if (start == std::string::npos) continue;
+            encodings.push_back(encoding.substr(start));
+        }
+    }
+
     // Parse Content-Length for POST requests
     size_t content_len = 0;
     size_t cl_pos = request.find("Content-Length: ");
@@ -173,9 +227,22 @@ void handle_client(int client_fd) {
     } else if (path.starts_with("/echo/")) {
         // extract string after `/echo/`
         std::string str_to_echo = path.substr(6);
-        response =
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
-            std::to_string(str_to_echo.size()) + "\r\n\r\n" + str_to_echo;
+        // check encoding
+        bool supports_gzip = std::find(encodings.begin(), encodings.end(),
+                                       "gzip") != encodings.end();
+        if (supports_gzip) {
+            // compress the body
+            std::string compressed = gzip_compress(str_to_echo);
+            response =
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Type: "
+                "text/plain\r\nContent-Length: " +
+                std::to_string(compressed.size()) + "\r\n\r\n" + compressed;
+        } else {
+            response =
+                "HTTP/1.1 200 OK\r\nContent-Type: "
+                "text/plain\r\nContent-Length: " +
+                std::to_string(str_to_echo.size()) + "\r\n\r\n" + str_to_echo;
+        }
     } else if (path.starts_with("/user-agent")) {
         response =
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +

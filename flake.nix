@@ -45,15 +45,15 @@
               # Development time dependencies
               gtest
 
-              lua5_4_compat
-              sol2
-
               starship
+
+              pkg-config
             ];
 
             buildInputs = with pkgs; [
               # stdlib for cpp
               # llvm.libcxx
+              zlib
             ];
 
             CXXFLAGS = "-Wall -Wfatal-errors -std=c++23";
