@@ -1,5 +1,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <poll.h>
+#include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -7,6 +9,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cerrno>
 #include <condition_variable>
 #include <csignal>
 #include <cstdlib>
@@ -27,6 +31,9 @@ std::atomic<bool> g_shutdown_requested{false};
 
 const std::string TMP_DIR = "/tmp";
 std::string g_files_dir{};
+
+constexpr int KEEP_ALIVE_TIMEOUT_MS = 60000;      // 60 seconds
+constexpr size_t MAX_REQUEST_SIZE = 1024 * 1024;  // 1MB limit
 
 // Signal handler
 // signal handlers are called by OS kernel, which uses C calling conventions
@@ -160,24 +167,58 @@ std::string gzip_compress(const std::string& data) {
     return compressed;
 }
 
-// HTTP request handler
-void handle_client(int client_fd) {
-    // Read http request from client
-    char buffer[1024] = {0};
-    auto bytes_read = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-    if (bytes_read < 0) {
-        std::cerr << "Failed to read request from client: " << client_fd
-                  << std::endl;
-        return;
+/**
+ * Send al data, handling partial writes
+ */
+bool send_all(int fd, const std::string& data) {
+    size_t total_sent = 0;
+    while (total_sent < data.size()) {
+        ssize_t sent =
+            send(fd, data.data() + total_sent, data.size() - total_sent, 0);
+        if (sent < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (sent == 0) return false;
+        total_sent += sent;
     }
+    return true;
+}
 
-    // Parse
-    std::string request(buffer);
+bool process_single_request(int client_fd, const std::string& request) {
     size_t method_end = request.find(' ');
     std::string method = request.substr(0, method_end);
     size_t path_end = request.find(' ', method_end + 1);
     std::string path =
         request.substr(method_end + 1, path_end - 1 - method_end);
+
+    // parse HTTP version
+    size_t version_end = request.find("\r\n");
+    std::string http_version =
+        request.substr(path_end + 1, version_end - 1 - path_end);
+    bool is_http_11 = (http_version.compare("HTTP/1.1") == 0);
+
+    bool keep_alive = is_http_11;  // HTTP/1.1 defaults to keep-alive
+
+    // parse Connection header
+    size_t conn_pos = request.find("Connection: ");
+    if (conn_pos != std::string::npos) {
+        size_t conn_start = conn_pos + 12;
+        size_t conn_end = request.find("\r\n", conn_start);
+        std::string conn_value =
+            request.substr(conn_start, conn_end - conn_start);
+        std::transform(conn_value.begin(), conn_value.end(), conn_value.begin(),
+                       ::tolower);
+        if (conn_value.find("close") != std::string::npos) {
+            keep_alive = false;
+        } else if (conn_value.find("keep-alive") != std::string::npos) {
+            keep_alive = true;
+        }
+    }
+
+    std::string conn_header =
+        keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
+
     std::string response;
     std::string user_agent;
     size_t ua_pos = request.find("User-Agent: ");
@@ -223,7 +264,7 @@ void handle_client(int client_fd) {
     }
 
     if (path == "/") {
-        response = "HTTP/1.1 200 OK\r\n\r\n";
+        response = "HTTP/1.1 200 OK\r\n" + conn_header + "\r\n";
     } else if (path.starts_with("/echo/")) {
         // extract string after `/echo/`
         std::string str_to_echo = path.substr(6);
@@ -233,28 +274,30 @@ void handle_client(int client_fd) {
         if (supports_gzip) {
             // compress the body
             std::string compressed = gzip_compress(str_to_echo);
-            response =
-                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Type: "
-                "text/plain\r\nContent-Length: " +
-                std::to_string(compressed.size()) + "\r\n\r\n" + compressed;
+            response = "HTTP/1.1 200 OK\r\n" + conn_header +
+                       "Content-Encoding: gzip\r\nContent-Type: "
+                       "text/plain\r\nContent-Length: " +
+                       std::to_string(compressed.size()) + "\r\n\r\n" +
+                       compressed;
         } else {
-            response =
-                "HTTP/1.1 200 OK\r\nContent-Type: "
-                "text/plain\r\nContent-Length: " +
-                std::to_string(str_to_echo.size()) + "\r\n\r\n" + str_to_echo;
+            response = "HTTP/1.1 200 OK\r\n" + conn_header +
+                       "Content-Type: "
+                       "text/plain\r\nContent-Length: " +
+                       std::to_string(str_to_echo.size()) + "\r\n\r\n" +
+                       str_to_echo;
         }
     } else if (path.starts_with("/user-agent")) {
-        response =
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
-            std::to_string(user_agent.size()) + "\r\n\r\n" + user_agent;
+        response = "HTTP/1.1 200 OK\r\n" + conn_header +
+                   "Content-Type: text/plain\r\nContent-Length: " +
+                   std::to_string(user_agent.size()) + "\r\n\r\n" + user_agent;
     } else if (path.starts_with("/files/")) {
         // return file, located at hardcoded path for now, `/tmp/`
         std::string filename = path.substr(7);
         // security: reject path traversal attempts
         if (filename.find("..") != std::string::npos) {
-            response = "HTTP/1.1 403 Forbidden\r\n\r\n";
+            response = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
         } else if (g_files_dir.empty()) {
-            response = "HTTP/1.1 404 Not Found\r\n\r\n";
+            response = "HTTP/1.1 404 Not Found\r\n" + conn_header + "\r\n";
         } else {
             std::string filepath = g_files_dir + filename;
             if (method.compare("GET") == 0) {
@@ -262,33 +305,116 @@ void handle_client(int client_fd) {
                 std::ifstream file(filepath, std::ios::binary);
 
                 if (!file) {
-                    response = "HTTP/1.1 404 Not Found\r\n\r\n";
+                    response =
+                        "HTTP/1.1 404 Not Found\r\n" + conn_header + "\r\n";
                 } else {
                     // read entire file into string
                     std::ostringstream ss;
                     ss << file.rdbuf();  // associated stream buffer
                     std::string content = ss.str();
-                    response =
-                        "HTTP/1.1 200 OK\r\nContent-Type: "
-                        "application/octet-stream\r\nContent-Length: " +
-                        std::to_string(content.size()) + "\r\n\r\n" + content;
+                    response = "HTTP/1.1 200 OK\r\n" + conn_header +
+                               "Content-Type: "
+                               "application/octet-stream\r\nContent-Length: " +
+                               std::to_string(content.size()) + "\r\n\r\n" +
+                               content;
                 }
             } else if (method.compare("POST") == 0) {
                 // POST
                 std::ofstream file(filepath, std::ios::binary);
                 if (!file) {
-                    response = "HTTP/1.1 500 Server Error\r\n\r\n";
+                    response =
+                        "HTTP/1.1 500 Server Error\r\nConnection: "
+                        "close\r\n\r\n";
                 } else {
                     file.write(body.data(), body.size());
-                    response = "HTTP/1.1 201 Created\r\n\r\n";
+                    response =
+                        "HTTP/1.1 201 Created\r\n" + conn_header + "\r\n";
                 }
             }
         }
     } else {
-        response = "HTTP/1.1 404 Not Found\r\n\r\n";
+        response = "HTTP/1.1 404 Not Found\r\n" + conn_header + "\r\n";
     }
 
-    send(client_fd, response.data(), response.size(), 0);
+    send_all(client_fd, response);
+
+    return keep_alive;
+}
+
+// HTTP request handler
+void handle_client(int client_fd) {
+    // Read http request from client
+    std::string buffer;
+    buffer.reserve(4096);
+    bool keep_alive = true;
+
+    while (keep_alive && !g_shutdown_requested.load()) {
+        // wait for data with 60-second timeout
+        struct pollfd pfd;
+        pfd.fd = client_fd;
+        pfd.events = POLLIN;
+
+        int poll_result = poll(&pfd, 1, KEEP_ALIVE_TIMEOUT_MS);
+        if (poll_result == 0) {
+            // timeout - close connection
+            break;
+        } else if (poll_result < 0) {
+            if (errno == EINTR) continue;  // interrupted by signal; retry
+            break;                         // other error
+        } else if (pfd.events & (POLLERR | POLLHUP | POLLNVAL)) {
+            // socket error or client closed
+            break;
+        }
+
+        // read available data
+        char temp[1024];
+        auto bytes_read = recv(client_fd, temp, sizeof(temp) - 1, 0);
+        if (bytes_read <= 0) {
+            break;
+        }
+
+        buffer.append(temp, bytes_read);
+
+        if (buffer.size() > MAX_REQUEST_SIZE) {
+            std::string error =
+                "HTTP/1.1 413 Payload Too Large\r\nConnection: close\r\n\r\n";
+            send_all(client_fd, error);
+            break;
+        }
+
+        // process complete requests from buffer
+        while (!buffer.empty()) {
+            size_t header_end = buffer.find("\r\n\r\n");
+            if (header_end == std::string::npos)
+                break;  // need more data for headers
+
+            // Parse Content-Length for POST requests
+            size_t content_len = 0;
+            size_t cl_pos = buffer.find("Content-Length: ");
+            if (cl_pos != std::string::npos && cl_pos < header_end) {
+                auto cl_start = cl_pos + 16;
+                auto cl_end = buffer.find("\r\n", cl_start);
+                content_len =
+                    std::stoul(buffer.substr(cl_start, cl_end - cl_start));
+            }
+
+            size_t total_size = header_end + 4 + content_len;
+
+            if (buffer.size() < total_size) {
+                break;  // need more data for body
+            }
+
+            // extract complete request
+            std::string request = buffer.substr(0, total_size);
+            buffer.erase(0, total_size);
+
+            // process request
+            keep_alive = process_single_request(client_fd, request);
+            if (!keep_alive) {
+                break;
+            }
+        }
+    }
 }
 
 int main(int argc, char** argv) {
