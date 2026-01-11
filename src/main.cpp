@@ -54,6 +54,9 @@ void setup_signal_handlers() {
 
 void handle_client(int client_fd);
 
+/**
+ * Each thread blocks on recv()/send()/poll()
+ */
 class ThreadPool {
    private:
     std::atomic<bool> shutdown_requested;

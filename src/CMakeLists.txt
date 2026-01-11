@@ -1,5 +1,16 @@
 add_executable(main main.cpp)
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
+
+option(USE_IOURING "Build io_uring-based HTTP server" OFF)
+if(USE_IOURING)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(URING REQUIRED liburing)
+  add_executable(main_iouring main_iouring.cpp)
+  target_compile_features(main_iouring PRIVATE cxx_std_23)
+  target_include_directories(main_iouring PRIVATE ${URING_INCLUDE_DIRS})
+  target_link_libraries(main_iouring ${URING_LIBRARIES} z)
+endif()
+
 target_link_libraries(main PRIVATE Threads::Threads ZLIB::ZLIB)
 target_sources(main PRIVATE main.cpp)

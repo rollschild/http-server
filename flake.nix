@@ -54,6 +54,7 @@
               # stdlib for cpp
               # llvm.libcxx
               zlib
+              liburing
             ];
 
             CXXFLAGS = "-Wall -Wfatal-errors -std=c++23";
